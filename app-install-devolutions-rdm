@@ -1,0 +1,199 @@
+# Install-DevolutionsRDM-Action1.ps1
+# Purpose: Install or update Devolutions Remote Desktop Manager silently
+# Designed for Action1 / RMM execution as Local System
+
+$ErrorActionPreference = "Stop"
+
+# ---------------- Settings ----------------
+$WorkDir = "C:\ProgramData\Action1\Installers\DevolutionsRDM"
+$LogDir  = "C:\ProgramData\Action1\Logs"
+$LogFile = Join-Path $LogDir "Install-DevolutionsRDM.log"
+
+$DownloadPage = "https://devolutions.net/remote-desktop-manager/download/"
+
+$ForceCloseRDM = $true
+$InstallDotNetRuntime = $true
+
+# ---------------- Functions ----------------
+function Write-Log {
+    param([string]$Message)
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$timestamp - $Message"
+
+    # Important:
+    # Do not use Write-Output here.
+    # Write-Output pollutes function return values in PowerShell.
+    [System.Console]::Out.WriteLine($line)
+
+    Add-Content -Path $LogFile -Value $line
+}
+
+function Exit-WithCode {
+    param([int]$Code)
+
+    Write-Log "Exiting with code $Code"
+    exit $Code
+}
+
+function Get-RDMInstall {
+    $paths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    foreach ($path in $paths) {
+        $found = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.DisplayName -like "Remote Desktop Manager*") -or
+                ($_.DisplayName -like "Devolutions Remote Desktop Manager*")
+            } |
+            Select-Object -First 1
+
+        if ($found) {
+            return $found
+        }
+    }
+
+    return $null
+}
+
+function Get-LatestRDMx64MsiUrl {
+    param([string]$PageUrl)
+
+    Write-Log "Fetching Devolutions RDM download page."
+
+    $page = Invoke-WebRequest -Uri $PageUrl -UseBasicParsing
+
+    $patterns = @(
+        'https://cdn\.devolutions\.net/download/Setup\.RemoteDesktopManager\.win-x64\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.msi',
+        'https://cdn\.devolutions\.net/download/Setup\.RemoteDesktopManager\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.msi'
+    )
+
+    foreach ($pattern in $patterns) {
+        $match = [regex]::Match($page.Content, $pattern)
+
+        if ($match.Success) {
+            return [string]$match.Value
+        }
+    }
+
+    throw "Could not find the latest Devolutions RDM MSI download URL."
+}
+
+# ---------------- Main ----------------
+try {
+    New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
+    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+
+    Write-Log "Starting Devolutions Remote Desktop Manager installation."
+    Write-Log "Running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    # ---------------- Existing Install Check ----------------
+    $existingInstall = Get-RDMInstall
+
+    if ($existingInstall) {
+        Write-Log "Existing RDM install detected."
+        Write-Log "DisplayName: $($existingInstall.DisplayName)"
+        Write-Log "DisplayVersion: $($existingInstall.DisplayVersion)"
+        Write-Log "InstallLocation: $($existingInstall.InstallLocation)"
+        Write-Log "Proceeding with latest MSI to install/update."
+    } else {
+        Write-Log "No existing RDM install detected."
+    }
+
+    # ---------------- Close RDM if Running ----------------
+    if ($ForceCloseRDM) {
+        Write-Log "Checking for running Remote Desktop Manager processes."
+
+        $rdmProcesses = Get-Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ProcessName -in @(
+                    "RemoteDesktopManager",
+                    "RemoteDesktopManager64",
+                    "RDM"
+                )
+            }
+
+        foreach ($proc in $rdmProcesses) {
+            Write-Log "Stopping process: $($proc.ProcessName) PID $($proc.Id)"
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # ---------------- Download Latest MSI ----------------
+    $msiUrl = Get-LatestRDMx64MsiUrl -PageUrl $DownloadPage
+    $msiUrl = [string]$msiUrl.Trim()
+
+    Write-Log "Resolved MSI URL: $msiUrl"
+
+    $installerName = Split-Path -Path $msiUrl -Leaf
+    $installerPath = Join-Path -Path $WorkDir -ChildPath $installerName
+    $msiLogPath = Join-Path -Path $LogDir -ChildPath "DevolutionsRDM-MSI.log"
+
+    Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+
+    Write-Log "Downloading Devolutions RDM MSI."
+
+    Invoke-WebRequest `
+        -Uri $msiUrl `
+        -OutFile $installerPath `
+        -UseBasicParsing
+
+    if (-not (Test-Path $installerPath)) {
+        throw "RDM MSI download failed."
+    }
+
+    $installerSize = [Math]::Round((Get-Item $installerPath).Length / 1MB, 2)
+    Write-Log "Downloaded installer size: $installerSize MB"
+
+    # ---------------- Install ----------------
+    Write-Log "Starting silent MSI installation."
+
+    $msiArgs = @(
+        "/i `"$installerPath`"",
+        "/quiet",
+        "/norestart",
+        "INSTALLMODE=Complete",
+        "/L*v `"$msiLogPath`""
+    )
+
+    if ($InstallDotNetRuntime) {
+        $msiArgs += 'INSTALL_DOTNET_RUNTIME="1"'
+        Write-Log "INSTALL_DOTNET_RUNTIME enabled."
+    }
+
+    $argumentString = $msiArgs -join " "
+    Write-Log "msiexec arguments: $argumentString"
+
+    $process = Start-Process `
+        -FilePath "msiexec.exe" `
+        -ArgumentList $argumentString `
+        -Wait `
+        -PassThru
+
+    $exitCode = $process.ExitCode
+    Write-Log "msiexec exit code: $exitCode"
+
+    if ($exitCode -eq 0) {
+        Write-Log "Devolutions RDM installation completed successfully."
+        Exit-WithCode 0
+    }
+    elseif ($exitCode -eq 3010) {
+        Write-Log "Devolutions RDM installation completed successfully. Reboot required."
+        Exit-WithCode 0
+    }
+    elseif ($exitCode -eq 1641) {
+        Write-Log "Devolutions RDM installation completed successfully. Reboot initiated."
+        Exit-WithCode 0
+    }
+    else {
+        throw "Devolutions RDM installation failed with msiexec exit code $exitCode."
+    }
+}
+catch {
+    Write-Log "ERROR: $($_.Exception.Message)"
+    Exit-WithCode 1
+}

@@ -1,0 +1,183 @@
+# Install-Visio365-Action1.ps1
+# Purpose: Install Microsoft 365 Visio desktop app using Office Deployment Tool
+# Designed for Action1 / RMM execution as Local System
+
+$ErrorActionPreference = "Stop"
+
+# ---------------- Settings ----------------
+$WorkDir = "C:\ProgramData\Action1\Installers\Visio365"
+$LogDir  = "C:\ProgramData\Action1\Logs"
+$LogFile = Join-Path $LogDir "Install-Visio365.log"
+
+$Language = "en-us"
+
+# Set to $true if you want Office apps forcibly closed during install
+$ForceCloseOfficeApps = $false
+
+# Microsoft Office Deployment Tool download page
+$OdtDownloadPage = "https://www.microsoft.com/en-us/download/confirmation.aspx?id=49117"
+
+# ---------------- Functions ----------------
+function Write-Log {
+    param([string]$Message)
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$timestamp - $Message"
+
+    Write-Output $line
+    Add-Content -Path $LogFile -Value $line
+}
+
+function Exit-WithCode {
+    param([int]$Code)
+
+    Write-Log "Exiting with code $Code"
+    exit $Code
+}
+
+# ---------------- Prep ----------------
+try {
+    New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
+    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+
+    Write-Log "Starting Visio for Microsoft 365 installation."
+    Write-Log "Running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    # ---------------- Already Installed Check ----------------
+    $c2rRegPath = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+    $existingProducts = $null
+    $officeInstalled = $false
+
+    if (Test-Path $c2rRegPath) {
+        $officeConfig = Get-ItemProperty -Path $c2rRegPath -ErrorAction SilentlyContinue
+        $existingProducts = $officeConfig.ProductReleaseIds
+        $officeInstalled = $true
+
+        Write-Log "Detected Click-to-Run Office installation."
+        Write-Log "Existing ProductReleaseIds: $existingProducts"
+
+        if ($existingProducts -match "VisioProRetail") {
+            Write-Log "VisioProRetail already appears to be installed. No action needed."
+            Exit-WithCode 0
+        }
+    } else {
+        Write-Log "No existing Click-to-Run Office configuration found. Visio will be installed standalone."
+    }
+
+    # ---------------- Download Office Deployment Tool ----------------
+    Write-Log "Downloading Office Deployment Tool page."
+
+    $page = Invoke-WebRequest -Uri $OdtDownloadPage -UseBasicParsing
+
+    $odtUrl = ($page.Links |
+        Where-Object { $_.href -match "download\.microsoft\.com/.+officedeploymenttool.*\.exe" } |
+        Select-Object -First 1).href
+
+    if (-not $odtUrl) {
+        $match = [regex]::Match(
+            $page.Content,
+            'https://download\.microsoft\.com/download/[^"]+officedeploymenttool[^"]+\.exe'
+        )
+
+        if ($match.Success) {
+            $odtUrl = $match.Value
+        }
+    }
+
+    if (-not $odtUrl) {
+        throw "Could not locate Office Deployment Tool download URL."
+    }
+
+    Write-Log "Office Deployment Tool URL found."
+
+    $OdtExe = Join-Path $WorkDir "officedeploymenttool.exe"
+    $OdtExtractDir = Join-Path $WorkDir "ODT"
+    $SetupExe = Join-Path $OdtExtractDir "setup.exe"
+    $ConfigPath = Join-Path $WorkDir "install-visio365.xml"
+
+    Remove-Item -Path $OdtExtractDir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -Path $OdtExtractDir -ItemType Directory -Force | Out-Null
+
+    Write-Log "Downloading Office Deployment Tool executable."
+    Invoke-WebRequest -Uri $odtUrl -OutFile $OdtExe -UseBasicParsing
+
+    if (-not (Test-Path $OdtExe)) {
+        throw "Office Deployment Tool download failed."
+    }
+
+    # ---------------- Extract ODT ----------------
+    Write-Log "Extracting Office Deployment Tool."
+
+    $extractProcess = Start-Process `
+        -FilePath $OdtExe `
+        -ArgumentList "/quiet /extract:`"$OdtExtractDir`"" `
+        -Wait `
+        -PassThru
+
+    Write-Log "ODT extract exit code: $($extractProcess.ExitCode)"
+
+    if (-not (Test-Path $SetupExe)) {
+        throw "setup.exe was not found after extracting Office Deployment Tool."
+    }
+
+    # ---------------- Build ODT XML ----------------
+    $forceValue = if ($ForceCloseOfficeApps) { "TRUE" } else { "FALSE" }
+
+    if ($officeInstalled) {
+        # Match the already-installed Office languages where possible
+        $languageXml = '<Language ID="MatchInstalled" TargetProduct="All" />'
+        Write-Log "Using MatchInstalled language behavior."
+    } else {
+        $languageXml = "<Language ID=`"$Language`" />"
+        Write-Log "Using language: $Language"
+    }
+
+    $xml = @"
+<Configuration>
+  <Add>
+    <Product ID="VisioProRetail">
+      $languageXml
+    </Product>
+  </Add>
+  <Updates Enabled="TRUE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="$forceValue" />
+</Configuration>
+"@
+
+    $xml | Out-File -FilePath $ConfigPath -Encoding UTF8 -Force
+
+    Write-Log "ODT configuration created at $ConfigPath"
+    Write-Log "Starting Visio installation."
+
+    # ---------------- Install Visio ----------------
+    $installProcess = Start-Process `
+        -FilePath $SetupExe `
+        -ArgumentList "/configure `"$ConfigPath`"" `
+        -Wait `
+        -PassThru
+
+    $exitCode = $installProcess.ExitCode
+    Write-Log "Office Deployment Tool install exit code: $exitCode"
+
+    # 0 = success
+    # 3010 = success, reboot required
+    if ($exitCode -eq 0) {
+        Write-Log "Visio installation completed successfully."
+        Exit-WithCode 0
+    }
+    elseif ($exitCode -eq 3010) {
+        Write-Log "Visio installation completed successfully. Reboot required."
+        Exit-WithCode 0
+    }
+    else {
+        Write-Log "Visio installation failed with exit code $exitCode."
+        Exit-WithCode $exitCode
+    }
+}
+catch {
+    Write-Log "ERROR: $($_.Exception.Message)"
+    Exit-WithCode 1
+}

@@ -1,0 +1,165 @@
+# Install-VSCode-Action1.ps1
+# Purpose: Install or update Visual Studio Code system-wide
+# Designed for Action1 / RMM execution as Local System
+
+$ErrorActionPreference = "Stop"
+
+# ---------------- Settings ----------------
+$WorkDir = "C:\ProgramData\Action1\Installers\VSCode"
+$LogDir  = "C:\ProgramData\Action1\Logs"
+$LogFile = Join-Path $LogDir "Install-VSCode.log"
+
+# Installer tasks:
+# !runcode prevents VS Code from launching after install.
+# addcontextmenufiles/addcontextmenufolders add right-click options.
+# addtopath adds VS Code to PATH.
+$InstallerTasks = "!runcode,addcontextmenufiles,addcontextmenufolders,addtopath"
+
+# ---------------- Functions ----------------
+function Write-Log {
+    param([string]$Message)
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$timestamp - $Message"
+
+    Write-Output $line
+    Add-Content -Path $LogFile -Value $line
+}
+
+function Exit-WithCode {
+    param([int]$Code)
+
+    Write-Log "Exiting with code $Code"
+    exit $Code
+}
+
+function Get-VSCodeInstall {
+    $paths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    foreach ($path in $paths) {
+        Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.DisplayName -like "Microsoft Visual Studio Code*" -and
+                $_.Publisher -like "Microsoft*"
+            } |
+            Select-Object -First 1
+    }
+}
+
+# ---------------- Main ----------------
+try {
+    New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
+    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+
+    Write-Log "Starting Visual Studio Code installation."
+    Write-Log "Running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    # ---------------- Architecture Detection ----------------
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    Write-Log "Detected architecture: $arch"
+
+    switch ($arch) {
+        "ARM64" {
+            $Platform = "win32-arm64"
+            $InstallerName = "VSCodeSetup-arm64.exe"
+        }
+        default {
+            $Platform = "win32-x64"
+            $InstallerName = "VSCodeSetup-x64.exe"
+        }
+    }
+
+    # System installer endpoint.
+    # Do NOT use win32-x64-user here, because Action1 runs as Local System.
+    $InstallerUrl = "https://update.code.visualstudio.com/latest/$Platform/stable"
+    $InstallerPath = Join-Path $WorkDir $InstallerName
+    $SetupLogPath = Join-Path $LogDir "VSCode-Setup.log"
+
+    Write-Log "Using VS Code platform: $Platform"
+    Write-Log "Download URL: $InstallerUrl"
+
+    # ---------------- Existing Install Check ----------------
+    $existingInstall = Get-VSCodeInstall
+
+    if ($existingInstall) {
+        Write-Log "Existing VS Code install detected."
+        Write-Log "DisplayName: $($existingInstall.DisplayName)"
+        Write-Log "DisplayVersion: $($existingInstall.DisplayVersion)"
+        Write-Log "InstallLocation: $($existingInstall.InstallLocation)"
+        Write-Log "Proceeding with latest installer to install/update."
+    } else {
+        Write-Log "No existing VS Code system install detected."
+    }
+
+    # ---------------- Download Installer ----------------
+    Write-Log "Downloading latest Visual Studio Code installer."
+
+    Remove-Item -Path $InstallerPath -Force -ErrorAction SilentlyContinue
+
+    Invoke-WebRequest `
+        -Uri $InstallerUrl `
+        -OutFile $InstallerPath `
+        -UseBasicParsing
+
+    if (-not (Test-Path $InstallerPath)) {
+        throw "VS Code installer download failed."
+    }
+
+    $installerSize = [Math]::Round((Get-Item $InstallerPath).Length / 1MB, 2)
+    Write-Log "Downloaded installer size: $installerSize MB"
+
+    # ---------------- Install ----------------
+    Write-Log "Starting silent VS Code installation."
+
+    $arguments = @(
+        "/VERYSILENT",
+        "/NORESTART",
+        "/MERGETASKS=`"$InstallerTasks`"",
+        "/LOG=`"$SetupLogPath`""
+    ) -join " "
+
+    Write-Log "Installer arguments: $arguments"
+
+    $process = Start-Process `
+        -FilePath $InstallerPath `
+        -ArgumentList $arguments `
+        -Wait `
+        -PassThru
+
+    $exitCode = $process.ExitCode
+    Write-Log "VS Code installer exit code: $exitCode"
+
+    # Inno Setup commonly uses:
+    # 0 = success
+    # 3010 = success, reboot required
+    if ($exitCode -eq 0) {
+        Write-Log "Visual Studio Code installation completed successfully."
+    }
+    elseif ($exitCode -eq 3010) {
+        Write-Log "Visual Studio Code installation completed successfully. Reboot required."
+    }
+    else {
+        throw "VS Code installation failed with exit code $exitCode."
+    }
+
+    # ---------------- Verify ----------------
+    $codeCmd = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+
+    if (Test-Path $codeCmd) {
+        $version = & $codeCmd --version 2>$null | Select-Object -First 1
+        Write-Log "Installed VS Code version: $version"
+    } else {
+        Write-Log "WARNING: code.cmd not found at expected path: $codeCmd"
+    }
+
+    Exit-WithCode 0
+}
+catch {
+    Write-Log "ERROR: $($_.Exception.Message)"
+    Exit-WithCode 1
+}
